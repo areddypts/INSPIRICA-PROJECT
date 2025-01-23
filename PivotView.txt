@@ -1,0 +1,319 @@
+// Added percentage and invoiced 
+
+WITH cte1 AS (
+    SELECT 
+    c.name AS ClientName, 
+    c.Id AS ClientId, 
+    p.Id AS ProjectId,
+    p.name AS ProjectName, 
+    SUM(COALESCE(vc.Amount, 0)) AS EquipmentAndServiceCost 
+FROM clients c
+LEFT JOIN projects p ON c.id = p.ClientId
+LEFT JOIN [customer-pos] cp ON p.id = cp.ProjectId 
+                            AND cp.approvedDate IS NOT NULL
+LEFT JOIN [vendor-costs] vc ON cp.id = vc.CustomerPOId
+                             AND vc.Amount IS NOT NULL 
+                             AND vc.status = 'APPROVED'
+GROUP BY c.name, c.Id, p.Id, p.name
+),
+cte2 AS (
+    SELECT 
+    c.name AS ClientName, 
+    c.Id AS ClientId, 
+    p.Id AS ProjectId,
+    p.name AS ProjectName, 
+    SUM(COALESCE(i.PoTaxAmount, 0) + COALESCE(i.PoShippingAmount, 0)) AS ShippingAndTaxCost
+FROM clients c
+LEFT JOIN projects p ON c.id = p.ClientId
+LEFT JOIN [customer-pos] cp ON p.id = cp.ProjectId 
+                            AND cp.approvedDate IS NOT NULL
+LEFT JOIN invoicings i ON cp.id = i.CustomerPOId 
+                        AND i.DeclinedDate IS NULL
+GROUP BY c.name, c.Id, p.Id, p.name
+),
+LatestUserTitleRates AS (
+    SELECT
+        utr.Id,
+        utr.UserTitleId,
+        utr.ClientRate,
+        utr.OvertimeRate,
+        utr.HolidayRate,
+        utr.InHouseRate,
+        utr.SubContractedRate,
+        utr.StartDate,
+        utr.IsDeleted,
+        ROW_NUMBER() OVER (PARTITION BY utr.UserTitleId ORDER BY utr.StartDate DESC) AS RowNum
+    FROM 
+        [users-title-rates] utr
+    WHERE
+        utr.IsDeleted = 0
+),
+  cte3 as (
+  SELECT c.Name AS ClientName, 
+        c.Id AS ClientId,
+        p.Id AS ProjectId, 
+        p.Name AS ProjectName, 
+        COALESCE(SUM(ta.RegularHours), 0) AS RegularHours,  -- Ensure NULLs are treated as 0
+        COALESCE(SUM(ta.OvertimeHours), 0) AS OvertimeHours, 
+        COALESCE(SUM(ta.HolidayHours), 0) AS HolidayHours,
+        COALESCE(SUM(
+            (ta.RegularHours * lutr.InHouseRate) +
+            (ta.OvertimeHours * lutr.OvertimeRate) +
+            (ta.HolidayHours * lutr.OvertimeRate)
+        ), 0) AS TotalLaborCost
+  FROM 
+        [projects] p  -- Start with projects to ensure all are included
+    LEFT JOIN [Project-Tasks] pt ON pt.ProjectId = p.Id  -- Join project tasks (presuming projects have tasks)
+    LEFT JOIN [timesheet-activities] ta ON ta.ProjectTaskId = pt.Id AND ta.ApprovedDate IS NOT NULL  
+    AND ta.SubmittedByUserId IS NOT NULL  
+    LEFT JOIN [User-Titles] ut ON ut.Id = ta.UserTitleId  -- Join to user titles
+    LEFT JOIN clients c ON c.HubSpotClientId = p.HubSpotClientId  -- Join clients table
+    LEFT JOIN LatestUserTitleRates lutr ON (lutr.UserTitleId = ta.UserTitleId AND lutr.RowNum = 1)
+   GROUP BY 
+        c.Name, c.Id,
+		p.Id, p.Name
+),
+cte4 AS (
+    SELECT 
+    c.name AS ClientName, 
+    c.Id AS ClientId, 
+    p.Id AS ProjectId,
+    p.name AS ProjectName, 
+    COALESCE(SUM(ei.amount), 0) AS TotalExpenseAmount
+FROM projects p
+LEFT JOIN clients c ON c.id = p.ClientId
+LEFT JOIN expenses e ON e.ProjectId = p.Id AND e.Date > '2024-01-01' AND e.ApprovedDate IS NOT NULL AND e.IsDeleted = 0
+LEFT JOIN [expense-items] ei ON ei.ExpenseId = e.Id
+GROUP BY c.name, c.Id, p.Id, p.name
+),
+AggregatedData AS (
+    SELECT 
+        Cp.ProjectId,
+        SUM(Cp.EquipmentAndServicesAmount) AS TotalEquipmentAndServicesAmount, 
+        SUM(Cp.BillableTaxAmount) AS TotalBillableTaxAmount,
+        SUM(Cp.BillableShippingAmount) AS TotalBillableShippingAmount,
+        SUM(Cp.LaborAmount) AS TotalLaborAmount
+    FROM [customer-pos] Cp
+    WHERE Cp.Status = 'APPROVED'
+        AND Cp.IsDeleted = 0
+    GROUP BY Cp.ProjectId
+),
+cte_client_cost AS (
+    SELECT 
+        c.name AS ClientName, 
+        c.Id AS ClientId, 
+        p.Id AS ProjectId,
+        p.name AS ProjectName, 
+        ISNULL(Agg.TotalEquipmentAndServicesAmount, 0) + 
+        ISNULL(Agg.TotalBillableTaxAmount, 0) + 
+        ISNULL(Agg.TotalBillableShippingAmount, 0) + 
+        ISNULL(Agg.TotalLaborAmount, 0) as clientCost
+    FROM projects p
+    LEFT JOIN AggregatedData Agg ON p.Id = Agg.ProjectId
+    LEFT JOIN clients c ON p.ClientId = c.Id
+),
+customer_pos_data AS (
+    SELECT 
+    c.name AS ClientName, 
+    p.name AS ProjectName, 
+    c.id AS ClientId, 
+    p.id AS ProjectId, 
+    SUM(COALESCE(cp.EquipmentAndServicesAmount, 0)) AS EquipmentAndServicesSold, 
+    SUM(COALESCE(cp.BillableTaxAmount, 0) + COALESCE(cp.BillableShippingAmount, 0)) AS ShippingAndTaxesSold, 
+    SUM(COALESCE(cp.LaborAmount, 0)) AS LaborSold
+FROM clients c
+LEFT JOIN projects p ON c.id = p.ClientId
+LEFT JOIN [customer-pos] cp ON p.id = cp.ProjectId AND cp.approvedDate IS NOT NULL 
+                               AND (cp.IsDeleted = 0 OR cp.IsDeleted IS NULL)
+GROUP BY c.name, p.name, c.id, p.id
+),
+TIA AS (
+    SELECT 
+        c.name AS ClientName, 
+        p.name AS ProjectName,
+        c.id AS ClientID, 
+        p.id AS ProjectId, 
+        COALESCE(SUM(i.[InvoicingAmount]), 0) AS TotalInvoicedAmount
+    FROM clients c
+    LEFT JOIN projects p ON c.id = p.ClientId
+    LEFT JOIN [customer-pos] cp ON p.id = cp.ProjectId
+    LEFT JOIN invoicings i ON cp.id = i.CustomerPOId AND i.DeclinedDate IS NULL
+    WHERE cp.Status = 'APPROVED' AND i.InvoicingAmount IS NOT NULL
+    GROUP BY c.name, p.name, c.id, p.id
+),
+
+FinalResult AS (
+    SELECT 
+        COALESCE(cte_client_cost.ClientId, cte1.ClientId, cte2.ClientId, cte3.ClientId, cte4.ClientId, customer_pos_data.ClientId) AS ClientId,
+        COALESCE(cte_client_cost.ProjectId, cte1.ProjectId, cte2.ProjectId, cte3.ProjectId, cte4.ProjectId, customer_pos_data.ProjectId) AS ProjectId,
+        COALESCE(cte_client_cost.ClientName, cte1.ClientName, cte2.ClientName, cte3.ClientName, cte4.ClientName, customer_pos_data.ClientName) AS ClientName,
+        COALESCE(cte_client_cost.ProjectName, cte1.ProjectName, cte2.ProjectName, cte3.ProjectName, cte4.ProjectName, customer_pos_data.ProjectName) AS ProjectName,
+        COALESCE(customer_pos_data.EquipmentAndServicesSold, 0) AS EquipmentAndServicesSold,
+        COALESCE(cte1.EquipmentAndServiceCost, 0) AS EquipmentAndServiceCost,
+        COALESCE(customer_pos_data.ShippingAndTaxesSold, 0) AS ShippingAndTaxesSold,
+        COALESCE(cte2.ShippingAndTaxCost, 0) AS ShippingAndTaxCost,
+        COALESCE(customer_pos_data.LaborSold, 0) AS LaborSold,
+        COALESCE(cte3.TotalLaborCost, 0) AS TotalLaborCost,
+        COALESCE(cte4.TotalExpenseAmount, 0) AS TotalExpenseAmount,
+        COALESCE(cte_client_cost.ClientCost, 0) AS ClientCost,
+        COALESCE(cte1.EquipmentAndServiceCost, 0) 
+            + COALESCE(cte2.ShippingAndTaxCost, 0) 
+            + COALESCE(cte3.TotalLaborCost, 0) 
+            + COALESCE(cte4.TotalExpenseAmount, 0) AS TotalCost,
+        COALESCE(cte_client_cost.ClientCost, 0) 
+            - (COALESCE(cte1.EquipmentAndServiceCost, 0) 
+            + COALESCE(cte2.ShippingAndTaxCost, 0) 
+            + COALESCE(cte3.TotalLaborCost, 0) 
+            + COALESCE(cte4.TotalExpenseAmount, 0)) AS Profit,
+        CASE 
+            WHEN COALESCE(cte_client_cost.ClientCost, 0) = 0 THEN NULL
+            ELSE ((COALESCE(cte_client_cost.ClientCost, 0) 
+                  - (COALESCE(cte1.EquipmentAndServiceCost, 0) 
+                  + COALESCE(cte2.ShippingAndTaxCost, 0) 
+                  + COALESCE(cte3.TotalLaborCost, 0) 
+                  + COALESCE(cte4.TotalExpenseAmount, 0))) 
+                  / COALESCE(cte_client_cost.ClientCost, 0)) * 100 
+        END AS ProfitMargin
+    FROM cte_client_cost
+    FULL OUTER JOIN cte1 ON cte_client_cost.ClientId = cte1.ClientId AND cte_client_cost.ProjectId = cte1.ProjectId
+    FULL OUTER JOIN cte2 ON cte_client_cost.ClientId = cte2.ClientId AND cte_client_cost.ProjectId = cte2.ProjectId
+    FULL OUTER JOIN cte3 ON cte_client_cost.ClientId = cte3.ClientId AND cte_client_cost.ProjectId = cte3.ProjectId
+    FULL OUTER JOIN cte4 ON cte_client_cost.ClientId = cte4.ClientId AND cte_client_cost.ProjectId = cte4.ProjectId
+    FULL OUTER JOIN customer_pos_data ON cte_client_cost.ClientId = customer_pos_data.ClientId AND cte_client_cost.ProjectId = customer_pos_data.ProjectId
+),
+
+TransposedData AS (
+    SELECT 
+        ClientId,
+        ProjectId,
+        ClientName,
+        ProjectName,
+        description, 
+        value,
+        order_col
+    FROM (
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Equipment & Service Sold Sub-Total' AS description, EquipmentAndServicesSold AS value, 1 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Equipment & Service Cost Sub-Total' AS description, EquipmentAndServiceCost AS value, 2 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Shipping And Taxes Sold Sub-Total' AS description, ShippingAndTaxesSold AS value, 3 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Shipping And Taxes Cost Sub-Total' AS description, ShippingAndTaxCost AS value, 4 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Labor Sold Sub-Total' AS description, LaborSold AS value, 5 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Labor Cost Sub-Total' AS description, TotalLaborCost AS value, 6 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Expense Cost Sub-Total' AS description, TotalExpenseAmount AS value, 7 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'CLIENT COST' AS description, ClientCost AS value, 8 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'COMPANY COST' AS description, TotalCost AS value, 9 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'PROFIT' AS description, Profit AS value, 10 AS order_col
+        FROM FinalResult
+        UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'MARGIN(%)' AS description, ProfitMargin AS value, 11 AS order_col
+        FROM FinalResult
+		UNION ALL
+        SELECT 
+            ClientId,
+            ProjectId,
+            ClientName,
+            ProjectName,
+            'Total Invoiced Amount' AS description, 
+            TotalInvoicedAmount AS value, 
+            12 AS order_col
+        FROM TIA
+        UNION ALL
+        SELECT 
+            FinalResult.ClientId,
+            FinalResult.ProjectId,
+            FinalResult.ClientName,
+            FinalResult.ProjectName,
+            'Percentage of Project Invoiced' AS description,
+            CASE 
+                WHEN ISNULL(FinalResult.ClientCost, 0) = 0 THEN NULL
+                ELSE (ISNULL(TIA.TotalInvoicedAmount, 0) / ISNULL(FinalResult.ClientCost, 0)) * 100 
+            END AS value, 
+            13 AS order_col
+        FROM FinalResult
+        LEFT JOIN TIA ON FinalResult.ProjectId = TIA.ProjectId
+    ) AS UnifiedData
+)
+SELECT 
+    td.ClientId, 
+    td.ProjectId, 
+    td.ClientName, 
+    td.ProjectName, 
+    td.description, 
+    td.value, 
+    td.order_col, 
+    hd.dealstage
+FROM TransposedData td
+LEFT JOIN hubspotdeals hd ON td.ProjectName = hd.dealname
+
